@@ -16,7 +16,11 @@ public class KubernetesPublisherTests
     {
         using var tempDir = new TempDirectory();
         // Arrange
-        var options = new OptionsMonitor(new KubernetesPublisherOptions() { OutputPath = tempDir.Path });
+        var options = new OptionsMonitor(
+            new KubernetesPublisherOptions()
+            {
+                OutputPath = tempDir.Path,
+            });
         var builder = DistributedApplication.CreateBuilder();
 
         var param0 = builder.AddParameter("param0");
@@ -26,13 +30,13 @@ public class KubernetesPublisherTests
 
         // Add a container to the application
         var api = builder.AddContainer("myapp", "mcr.microsoft.com/dotnet/aspnet:8.0")
-                         .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
-                         .WithHttpEndpoint(env: "PORT")
-                         .WithEnvironment("param0", param0)
-                         .WithEnvironment("param1", param1)
-                         .WithEnvironment("param2", param2)
-                         .WithReference(cs)
-                         .WithArgs("--cs", cs.Resource);
+            .WithEnvironment("ASPNETCORE_ENVIRONMENT", "Development")
+            .WithHttpEndpoint(env: "PORT")
+            .WithEnvironment("param0", param0)
+            .WithEnvironment("param1", param1)
+            .WithEnvironment("param2", param2)
+            .WithReference(cs)
+            .WithArgs("--cs", cs.Resource);
 
         builder.AddProject<TestProject>("project1", launchProfileName: null)
             .WithReference(api.GetEndpoint("http"));
@@ -41,16 +45,37 @@ public class KubernetesPublisherTests
 
         var model = app.Services.GetRequiredService<DistributedApplicationModel>();
 
-        var publisher = new KubernetesPublisher("test", options,
+        var publisher = new KubernetesPublisher(
+            "test", options,
             NullLogger<KubernetesPublisher>.Instance,
             new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish));
 
         // Act
-        var act = publisher.PublishAsync(model, CancellationToken.None);
+        await publisher.PublishAsync(model, CancellationToken.None);
 
         // Assert
-        // TODO: implement once the publisher is implemented.
-        await Assert.ThrowsAsync<NotImplementedException>(() => act);
+        var helmChartPath = Path.Combine(tempDir.Path, "Chart.yaml");
+        var valuesPath = Path.Combine(tempDir.Path, "values.yaml");
+        var templatesPath = Path.Combine(tempDir.Path, "templates");
+        var projectDeploymentPath = Path.Combine(templatesPath, "project1", "deployment.yaml");
+        var myappDeploymentPath = Path.Combine(templatesPath, "myapp", "deployment.yaml");
+
+        Assert.True(Directory.Exists(templatesPath));
+        Assert.True(File.Exists(helmChartPath));
+        Assert.True(File.Exists(valuesPath));
+        Assert.True(File.Exists(projectDeploymentPath));
+        Assert.True(File.Exists(myappDeploymentPath));
+
+        await AssertFileContentsEqual(helmChartPath, ExpectedContent.HelmChartContent);
+        await AssertFileContentsEqual(valuesPath, ExpectedContent.HelmValuesContent);
+        await AssertFileContentsEqual(projectDeploymentPath, ExpectedContent.ProjectOneDeploymentContent);
+        await AssertFileContentsEqual(myappDeploymentPath, ExpectedContent.MyAppDeploymentContent);
+    }
+
+    private static async Task AssertFileContentsEqual(string outputPath, string expected)
+    {
+        var outputContent = await File.ReadAllTextAsync(outputPath);
+        Assert.Equal(expected, outputContent, ignoreAllWhiteSpace: true, ignoreLineEndingDifferences: true);
     }
 
     private sealed class OptionsMonitor(KubernetesPublisherOptions options) : IOptionsMonitor<KubernetesPublisherOptions>
@@ -64,12 +89,8 @@ public class KubernetesPublisherTests
 
     private sealed class TempDirectory : IDisposable
     {
-        public TempDirectory()
-        {
-            Path = Directory.CreateTempSubdirectory(".aspire-kubernetes").FullName;
-        }
+        public string Path { get; } = Directory.CreateTempSubdirectory(".aspire-kubernetes").FullName;
 
-        public string Path { get; }
         public void Dispose()
         {
             if (File.Exists(Path))
