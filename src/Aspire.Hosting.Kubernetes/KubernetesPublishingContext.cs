@@ -19,8 +19,12 @@ internal class KubernetesPublishingContext(
     CancellationToken cancellationToken = default)
 {
     private const string TemplateFileSeparator = "---";
-    private readonly Dictionary<string, (string Description, string? DefaultValue)> _env = [];
+    private const string ParametersKey = "parameters";
     private readonly Dictionary<IResource, KubernetesComponentContext> _kubernetesComponents = [];
+    private readonly Dictionary<string, object> _helmValues = new()
+    {
+        [ParametersKey] = new Dictionary<string, object>(),
+    };
 
     private readonly ISerializer _serializer = new SerializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
@@ -59,11 +63,6 @@ internal class KubernetesPublishingContext(
         logger.FinishGeneratingKubernetes(publisherOptions.OutputPath);
     }
 
-    public void AddEnv(string name, string description, string? defaultValue = null)
-    {
-        _env[name] = (description, defaultValue);
-    }
-
     private async Task WriteKubernetesOutputAsync(DistributedApplicationModel model)
     {
         foreach (var resource in model.Resources)
@@ -83,10 +82,24 @@ internal class KubernetesPublishingContext(
             kubernetesComponentContext.BuildKubernetesResources();
 
             await WriteKubernetesTemplatesForResource(resource, kubernetesComponentContext.TemplatedResources).ConfigureAwait(false);
+            AppendResourceContextToHelmValues(resource, kubernetesComponentContext);
         }
 
         await WriteKubernetesHelmChartAsync().ConfigureAwait(false);
         await WriteKubernetesHelmValuesAsync().ConfigureAwait(false);
+    }
+
+    private void AppendResourceContextToHelmValues(IResource resource, KubernetesComponentContext resourceContext)
+    {
+        if (_helmValues[ParametersKey] is Dictionary<string, object> helmParameters)
+        {
+            if (resourceContext.Parameters.Count == 0)
+            {
+                return;
+            }
+
+            helmParameters[resource.Name] = resourceContext.Parameters;
+        }
     }
 
     private async Task WriteKubernetesTemplatesForResource(IResource resource, List<BaseKubernetesResource> templatedItems)
@@ -108,11 +121,10 @@ internal class KubernetesPublishingContext(
 
     private async Task WriteKubernetesHelmValuesAsync()
     {
-        var helmValues = new Dictionary<string, string>();
-        var valuesYalm = _serializer.Serialize(helmValues);
+        var valuesYaml = _serializer.Serialize(_helmValues);
         var outputFile = Path.Combine(publisherOptions.OutputPath!, "values.yaml");
         Directory.CreateDirectory(publisherOptions.OutputPath!);
-        await File.WriteAllTextAsync(outputFile, valuesYalm, cancellationToken).ConfigureAwait(false);
+        await File.WriteAllTextAsync(outputFile, valuesYaml, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task WriteKubernetesHelmChartAsync()
@@ -150,15 +162,31 @@ internal class KubernetesPublishingContext(
     {
         private record struct EndpointMapping(string Scheme, string Host, int InternalPort, int ExposedPort, bool IsHttpIngress);
         private readonly Dictionary<string, EndpointMapping> _endpointMapping = [];
-        public Dictionary<string, string> EnvironmentVariables { get; } = [];
+        public readonly Dictionary<string, string?> EnvironmentVariables = [];
+        public readonly Dictionary<string, string?> Secrets = [];
+        public readonly Dictionary<string, string> Parameters = [];
+        private Dictionary<string, string> _labels = [];
+
         public List<BaseKubernetesResource> TemplatedResources { get; } = [];
         private List<string> Commands { get; } = [];
         public List<VolumeMountV1> Volumes { get; } = [];
 
         public void BuildKubernetesResources()
         {
+            SetLabels();
+            CreateConfigMap();
+            CreateSecret();
             CreateStatefulSetResource();
             CreateDeploymentResource();
+        }
+
+        private void SetLabels()
+        {
+            _labels = new()
+            {
+                ["app"] = "aspire",
+                ["component"] = resource.Name,
+            };
         }
 
         private void CreateDeploymentResource()
@@ -172,18 +200,11 @@ internal class KubernetesPublishingContext(
             {
                 Metadata =
                 {
-                    Name = $"{resource.Name}-deployment",
+                    Name = CurrentResourceDeploymentName,
                 },
                 Spec =
                 {
-                    Selector = new()
-                    {
-                        MatchLabels =
-                        {
-                            ["app"] = "aspire",
-                            ["component"] = resource.Name,
-                        },
-                    },
+                    Selector = new(_labels.ToDictionary()),
                     Replicas = resource.GetReplicaCount(),
                     Template = CreatePodSpec(),
                     Strategy = new()
@@ -212,18 +233,11 @@ internal class KubernetesPublishingContext(
             {
                 Metadata =
                 {
-                    Name = $"{resource.Name}-statefulset",
+                    Name = CurrentResourceStatefulSetName,
                 },
                 Spec =
                 {
-                    Selector = new()
-                    {
-                        MatchLabels =
-                        {
-                            ["app"] = "aspire",
-                            ["component"] = resource.Name,
-                        },
-                    },
+                    Selector = new(_labels.ToDictionary()),
                     Replicas = resource.GetReplicaCount(),
                     Template = CreatePodSpec(),
                 },
@@ -238,11 +252,7 @@ internal class KubernetesPublishingContext(
             {
                 Metadata =
                 {
-                    Labels =
-                    {
-                        ["app"] = "aspire",
-                        ["component"] = resource.Name,
-                    },
+                    Labels = _labels.ToDictionary(),
                 },
                 Spec =
                 {
@@ -271,6 +281,7 @@ internal class KubernetesPublishingContext(
             SetContainerVolumes(container);
             SetContainerEntrypoint(container);
             SetContainerArgs(container);
+            SetContainerEnv(container);
 
             return container;
         }
@@ -284,10 +295,9 @@ internal class KubernetesPublishingContext(
 
             foreach (var volume in Volumes)
             {
-                container.VolumeMounts.Add(new VolumeMountV1
+                container.VolumeMounts.Add(new()
                 {
                     Name = volume.Name,
-
                 });
             }
         }
@@ -366,19 +376,96 @@ internal class KubernetesPublishingContext(
             }
         }
 
+        private void SetContainerEnv(ContainerV1 container)
+        {
+            if (EnvironmentVariables.Count > 0)
+            {
+                container.EnvFrom.Add(new()
+                {
+                    ConfigMapRef = new()
+                    {
+                        Name = CurrentResourceConfigMapName,
+                    },
+                });
+            }
+
+            if (Secrets.Count > 0)
+            {
+                container.EnvFrom.Add(new()
+                {
+                    SecretRef = new()
+                    {
+                        Name = CurrentResourceSecretName,
+                    },
+                });
+            }
+        }
+
+        private void CreateSecret()
+        {
+            if (Secrets.Count == 0)
+            {
+                return;
+            }
+
+            var secret = new Secret
+            {
+                Metadata =
+                {
+                    Name = CurrentResourceSecretName,
+                    Labels =
+                    {
+                        ["app"] = "aspire",
+                        ["component"] = resource.Name,
+                    },
+                },
+            };
+
+            foreach (var kvp in Secrets)
+            {
+                secret.StringData[kvp.Key] = kvp.Value ?? GetParameterExpression(kvp.Key);
+            }
+
+            TemplatedResources.Add(secret);
+        }
+
+        private void CreateConfigMap()
+        {
+            if (EnvironmentVariables.Count == 0)
+            {
+                return;
+            }
+
+            var configMap = new ConfigMap
+            {
+                Metadata =
+                {
+                    Name = CurrentResourceConfigMapName,
+                    Labels =
+                    {
+                        ["app"] = "aspire",
+                        ["component"] = resource.Name,
+                    },
+                },
+            };
+
+            foreach (var kvp in EnvironmentVariables)
+            {
+                configMap.Data[kvp.Key] = kvp.Value ?? GetParameterExpression(kvp.Key);
+            }
+
+            TemplatedResources.Add(configMap);
+        }
+
         private bool TryGetContainerImageName(IResource resourceInstance, out string? containerImageName)
         {
-            // If the resource has a Dockerfile build annotation, we don't have the image name
-            // it will come as a parameter
             if (resourceInstance.TryGetLastAnnotation<DockerfileBuildAnnotation>(out _) || resourceInstance is ProjectResource)
             {
                 var imageEnvName = $"{resourceInstance.Name.ToUpperInvariant().Replace("-", "_")}_IMAGE";
 
-                kubernetesPublishingContext.AddEnv(imageEnvName,
-                                                $"Container image name for {resourceInstance.Name}",
-                                                $"{resourceInstance.Name}:latest");
+                Parameters[imageEnvName] = $"{resourceInstance.Name}:latest";
 
-                containerImageName = $"${{{imageEnvName}}}";
+                containerImageName = GetParameterExpression(imageEnvName);
                 return false;
             }
 
@@ -502,7 +589,6 @@ internal class KubernetesPublishingContext(
                 {
                     return AllocateParameter(param);
                 }
-
                 if (value is ConnectionStringReference cs)
                 {
                     value = cs.Resource.ConnectionStringExpression;
@@ -559,42 +645,38 @@ internal class KubernetesPublishingContext(
             }
         }
 
+        private string AllocateParameter(ParameterResource parameter)
+        {
+            var formattedName = parameter.Name.ToUpperInvariant().Replace("-", "_");
+
+            if (parameter.Secret)
+            {
+                Secrets[formattedName] = parameter.Default is null ? null : parameter.Value;
+            }
+            else
+            {
+                EnvironmentVariables[formattedName] = parameter.Default is null ? null : parameter.Value;
+            }
+
+            return GetParameterExpression(formattedName);
+        }
+
         private string ResolveUnknownValue(IManifestExpressionProvider parameter)
         {
-            // Placeholder for resolving the actual parameter value
-            // https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#interpolation-syntax
-
-            // Treat secrets as environment variable placeholders as for now
-            // this doesn't handle generation of parameter values with defaults
-            var env = parameter.ValueExpression.Replace("{", "")
+            var formattedName = parameter.ValueExpression.Replace("{", "")
                      .Replace("}", "")
                      .Replace(".", "_")
                      .Replace("-", "_")
                      .ToUpperInvariant();
 
-            kubernetesPublishingContext.AddEnv(env, $"Unknown reference {parameter.ValueExpression}");
+            EnvironmentVariables[formattedName] = parameter.ValueExpression;
 
-            return $"${{{env}}}";
+            return GetParameterExpression(formattedName);
         }
-
-        private string ResolveParameterValue(ParameterResource parameter)
-        {
-            // Placeholder for resolving the actual parameter value
-            // https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/#interpolation-syntax
-
-            // Treat secrets as environment variable placeholders as for now
-            // this doesn't handle generation of parameter values with defaults
-            var env = parameter.Name.ToUpperInvariant().Replace("-", "_");
-
-            kubernetesPublishingContext.AddEnv(env, $"Parameter {parameter.Name}",
-                                            parameter.Secret || parameter.Default is null ? null : parameter.Value);
-
-            return $"${{{env}}}";
-        }
-
-        private string AllocateParameter(ParameterResource parameter)
-        {
-            return ResolveParameterValue(parameter);
-        }
+        private string CurrentResourceConfigMapName => $"{resource.Name}-config";
+        private string CurrentResourceSecretName => $"{resource.Name}-secret";
+        private string CurrentResourceDeploymentName => $"{resource.Name}-deployment";
+        private string CurrentResourceStatefulSetName => $"{resource.Name}-statefulset";
+        private string GetParameterExpression(string parameterName) => $"{{{{ .Values.{ParametersKey}.{resource.Name}.{parameterName} }}}}";
     }
 }

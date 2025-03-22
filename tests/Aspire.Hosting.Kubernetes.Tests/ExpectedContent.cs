@@ -23,7 +23,9 @@ public static class ExpectedContent
 
     public const string HelmValuesContent =
         """
-        {}
+        parameters:
+          project1:
+            PROJECT1_IMAGE: "project1:latest"
 
         """;
 
@@ -42,8 +44,11 @@ public static class ExpectedContent
                 component: "project1"
             spec:
               containers:
-                - image: "${PROJECT1_IMAGE}"
+                - image: "{{ .Values.parameters.project1.PROJECT1_IMAGE }}"
                   name: "project1"
+                  envFrom:
+                    - configMapRef:
+                        name: "project1-config"
                   imagePullPolicy: "IfNotPresent"
           selector:
             matchLabels:
@@ -76,9 +81,14 @@ public static class ExpectedContent
               containers:
                 - image: "mcr.microsoft.com/dotnet/aspnet:8.0"
                   name: "myapp"
+                  envFrom:
+                    - configMapRef:
+                        name: "myapp-config"
+                    - secretRef:
+                        name: "myapp-secret"
                   args:
                     - "--cs"
-                    - "Url=${PARAM0}, Secret=${PARAM1}"
+                    - "Url={{ .Values.parameters.myapp.PARAM0 }}, Secret={{ .Values.parameters.myapp.PARAM1 }}"
                   ports:
                     - name: "http"
                       protocol: "HTTP"
